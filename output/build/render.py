@@ -19,6 +19,9 @@ SRCF = load_src(FPS)
 NS = len(SRCF)
 C1 = int(round(CUT1 * FPS)); C2 = int(round(CUT2 * FPS))   # first frame idx of B and C
 faces30 = np.array(json.load(open("faces.json")))
+from scipy.ndimage import gaussian_filter1d
+for _a, _b in ((0, 180), (180, 358), (358, len(faces30))):
+    faces30[_a:_b] = gaussian_filter1d(faces30[_a:_b], 16, axis=0, mode="nearest")
 def face_at(idx):  # normalised face centre for a source frame index (faces were tracked at 30fps)
     j = min(len(faces30) - 1, int(round(idx * 30 / FPS)))
     return faces30[j]
@@ -32,7 +35,7 @@ def clip_frame(k, t):
 
 # ------------------------------------------------------------------ easing
 def clamp01(x): return max(0.0, min(1.0, x))
-def ease_out_cubic(p): return 1 - (1 - p) ** 3
+def ease_out_cubic(p): p = max(0.0, min(1.0, p)); return 1 - (1 - p) ** 3
 def ease_out_back(p, s=2.2):
     p = clamp01(p) - 1; return 1 + p * p * ((s + 1) * p + s)
 def ease_in_back(p, s=1.8):
@@ -41,50 +44,45 @@ def ease_io_quint(p):
     p = clamp01(p); return 16 * p ** 5 if p < .5 else 1 - (-2 * p + 2) ** 5 / 2
 def lerp(a, b, p): return a + (b - a) * p
 
-# ------------------------------------------------------------------ zoom plan: (t0, z_at_start, z_at_end_of_segment)
-ZOOM = [
-    (0.0, 1.00, 1.04), (1.0, 1.09, 1.06), (1.5, 1.01, 1.07), (2.5, 1.12, 1.09), (3.0, 1.02, 1.10),
-    (4.0, 1.20, 1.17),   # HARD PUNCH  (৳1500 kinlei)
-    (5.0, 1.04, 1.14),
-    (6.0, 1.32, 1.26),   # HARD PUNCH  (৳440 OFF! lands)
-    (7.0, 1.42, 1.30),   # HARD PUNCH  (brand name)
-    (8.0, 1.06, 1.16), (9.0, 1.26, 1.20), (9.5, 1.08, 1.18),
-    (10.0, 1.36, 1.30),  # HARD PUNCH  (steps start)
-    (11.0, 1.12, 1.22),
-    (12.0, 1.30, 1.22), (12.5, 1.04, 1.14), (13.0, 1.22, 1.28), (13.5, 1.08, 1.18),
-    (14.0, 1.30, 1.25),  # CTA #1
-    (15.0, 1.36, 1.44),  # CTA #2 -- final impact push
-    (16.5, 1.5, 1.5),
-]
-SNAP = 0.085   # seconds for a "hard" zoom snap
+# ------------------------------------------------------------------ zoom plan (smooth keyframes + a few hard punches)
+KEYS = [(0.0, 1.05), (2.0, 1.10), (3.6, 1.07), (4.0, 1.10), (5.9, 1.20),
+        (6.0, 1.20), (6.9, 1.24), (7.0, 1.26), (8.0, 1.30), (9.6, 1.14), (10.0, 1.15), (11.7, 1.28),
+        (12.0, 1.14), (13.6, 1.08), (14.0, 1.10), (14.9, 1.20), (15.0, 1.22), (16.5, 1.34)]
+PUNCH = {4.0: 0.10, 6.0: 0.10, 7.0: 0.10, 10.0: 0.10, 15.0: 0.07}   # extra push that snaps in then settles
+ZOOM = [(4.0,), (6.0,), (7.0,), (10.0,), (15.0,)]
+def smoothstep(p): p = clamp01(p); return p * p * (3 - 2 * p)
 def zoom_at(t):
-    for i in range(len(ZOOM) - 1):
-        t0, zs, ze = ZOOM[i]; t1 = ZOOM[i + 1][0]
+    z = KEYS[-1][1]
+    for (t0, z0), (t1, z1) in zip(KEYS, KEYS[1:]):
         if t0 <= t < t1:
-            z = lerp(zs, ze, (t - t0) / (t1 - t0))
-            if i > 0 and t - t0 < SNAP:
-                prev_end = ZOOM[i - 1][2]
-                z = lerp(prev_end, z, ease_out_cubic((t - t0) / SNAP))
-            return z, t0
-    return ZOOM[-1][1], ZOOM[-1][0]
+            z = lerp(z0, z1, smoothstep((t - t0) / (t1 - t0))); break
+    for tp, amp in PUNCH.items():
+        d = t - tp
+        if d >= 0: z += amp * ease_out_cubic(d / 0.12) * math.exp(-d / 0.9)
+    return z, 0.0
 
 def beat_pulse(t):
-    ph = t % BEAT
-    return 0.022 * math.exp(-ph / 0.09)
+    return 0.0
 
 def tilt_at(t):
-    z, t0 = zoom_at(t)
-    k = [i for i, s in enumerate(ZOOM) if s[0] == t0][0]
-    amp = 2.0 if t0 in PUNCHES else 1.3
-    return amp * (1 if k % 2 else -1) * math.exp(-(t - t0) / 0.2)
+    """very gentle handheld roll + a small kick on the hard punches"""
+    r = 0.30 * math.sin(2 * math.pi * t / 4.1) + 0.15 * math.sin(2 * math.pi * t / 2.3 + 1.0)
+    for k, tp in enumerate(PUNCH):
+        d = t - tp
+        if d >= 0: r += (0.9 if k % 2 else -0.9) * math.exp(-d / 0.25) * ease_out_cubic(d / 0.1)
+    return r
+
+def sway_at(t):
+    """slow handheld drift in px: the 'camera waving a bit'"""
+    sx = 11 * math.sin(2 * math.pi * t / 3.3) + 5 * math.sin(2 * math.pi * t / 1.9 + 1.3)
+    sy = 9 * math.sin(2 * math.pi * t / 2.7 + 0.5) + 4 * math.sin(2 * math.pi * t / 1.6)
+    return sx, sy
 
 def shake_at(t):
-    """screen shake on the two big hits"""
     s = 0.0
-    for th, a in ((6.0, 22), (15.0, 18), (7.0, 8), (4.0, 8), (10.0, 8)):
+    for th, a in ((6.0, 9), (15.0, 7)):
         d = t - th
-        if 0 <= d < 0.35:
-            s = max(s, a * math.exp(-d / 0.09))
+        if 0 <= d < 0.3: s = max(s, a * math.exp(-d / 0.08))
     return s
 
 # ------------------------------------------------------------------ view warp
@@ -101,10 +99,11 @@ def crop_view(src, face, z, rot, tx=0.0, ty=0.0, border=cv2.BORDER_REFLECT_101):
 def view_at(t, subt, i_cur):
     """Rendered view at (sub)time subt. Handles whip pans via a two-clip strip."""
     z0, _ = zoom_at(subt)
-    z = z0 * (1 + beat_pulse(subt))
+    z = max(z0, 1.04)
     rot = tilt_at(subt)
     sh = shake_at(subt)
-    sx = sh * math.sin(subt * 130) ; sy = sh * math.cos(subt * 110)
+    wx, wy = sway_at(subt)
+    sx = sh * math.sin(subt * 130) + wx; sy = sh * math.cos(subt * 110) + wy
     for (w0, w1, d), (ka, kb) in ((WHIP1, (0, 1)), (WHIP2, (1, 2))):
         if w0 <= subt <= w1:
             p = (subt - w0) / (w1 - w0)
@@ -133,7 +132,7 @@ def whip_progress(t):
 def render_video(t, i):
     # motion-blur sub-sampling: more samples on whip frames and just after hard snaps
     in_whip = whip_progress(t) is not None
-    snap_recent = any(0 <= t - s[0] < 0.11 for s in ZOOM[1:])
+    snap_recent = any(0 <= t - s[0] < 0.10 for s in ZOOM)
     if in_whip: K, shut = 18, 1.6 / FPS
     elif snap_recent: K, shut = 5, 0.8 / FPS
     else: K, shut = 1, 0.0
